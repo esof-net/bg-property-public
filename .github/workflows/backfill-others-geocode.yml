@@ -1,0 +1,79 @@
+# NOTE (data-store migration): data now moves through apps/scraper/data_store.py (GitHub Release assets), not git. Comments
+# below that mention git push / rebase / "ours" describe the OLD mechanism and are kept only as history.
+# One-time correction pass (see backfill_others_geocode.py's own
+# docstring for the full story): geocodes every olx.bg/sales.bcpea.org/
+# homes.bg/bazar.bg/imot.bg/imoti.bg listing currently in the site's
+# "Others" province bucket, using the already-safe, confidence-gated
+# Geocoder - a genuinely ambiguous settlement name (e.g. "Бяла", a real,
+# different municipality in both Varna and Ruse oblasts) is correctly
+# left unresolved rather than guessed at.
+#
+# workflow_dispatch only - a one-time catch-up job for the specific
+# backlog reported live ("all of them need allocation, not just half").
+# Importing all 6 scraper modules pulls in playwright at import time
+# (olx.bg/bcpea/imot.bg's own grid crawls use it) even though this
+# script never launches a browser - installed here but never invoked.
+#
+# Deliberately NOT in scrape.yml's shared "scrape-property-listings"
+# concurrency group: this script only ever touches
+# leads_{olx,bcpea,homes,bazar,imot,imoti_bg}.json/history_*.json - a
+# real, confirmed run got stuck waiting behind a 3+ hour scrape-large.yml
+# run (which only touches leads.json/leads_alo.json - completely
+# disjoint files) and kept getting bumped from the queue by the OTHER ~10
+# crons also sharing that one group before it ever got a turn, real
+# starvation, not bad luck, on a job the live report needs done now. Its
+# own commit step below still rebases against main and, on a genuine
+# conflict from some other backfill's run landing in the meantime, keeps
+# main's version of just the conflicted files rather than failing outright
+# and losing this run's own progress on everything else - same fallback
+# scrape.yml/scrape-large.yml already rely on for exactly this reason.
+name: Backfill province allocation for "Others" (text-geocodable portals)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: backfill-others-geocode
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests beautifulsoup4 playwright
+
+      # Data lives in the data-store release (not in git): see apps/scraper/data_store.py
+      - id: pull
+        run: python apps/scraper/data_store.py pull @olx @bcpea @homes @bazar @imot @imoti_bg @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: python apps/scraper/backfill_others_geocode.py
+        timeout-minutes: 180
+
+      # Per-run backup of what this run pulled + wrote (the release only keeps the latest copy).
+      - if: always() && steps.pull.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup-${{ github.run_id }}
+          path: |
+            data/*.json*
+            !data/bg_*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Replaces the old git add/commit/rebase/push block: data_store.py merges history files if another
+      # workflow uploaded in between, skips files that did not change, and fails loudly with the HTTP body.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/data_store.py push @olx @bcpea @homes @bazar @imot @imoti_bg @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

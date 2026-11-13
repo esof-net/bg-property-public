@@ -1,0 +1,80 @@
+# NOTE (data-store migration): data now moves through apps/scraper/data_store.py (GitHub Release assets), not git. Comments
+# below that mention git push / rebase / "ours" describe the OLD mechanism and are kept only as history.
+# Fills in lat/lng for homes.bg listings the nationwide scraper left
+# uncoordinated (see backfill_geocode_homes.py and scraper_homes.py's
+# module docstring for why: live geocoding at nationwide scale doesn't fit
+# in the scrape itself). Each run processes a bounded chunk
+# (MAX_LOOKUPS_PER_RUN), not everything at once. Own dedicated
+# concurrency group, not shared with scrape.yml or the other backfills -
+# a shared group only ever keeps one *queued* run, so with this many
+# hourly-ish backfill/geocode workflows funneling into one slot, a later
+# schedule firing while an earlier one was still queued canceled it
+# outright rather than just delaying it (confirmed live: runs were being
+# canceled every few minutes). Any git push race with a concurrent
+# scrape/backfill is already handled by the rebase-retry-with-ours
+# fallback below, same as always.
+#
+# Was workflow_dispatch-only - never actually re-run by hand at any real
+# volume, so ~71% of homes.bg (49,217 listings) sat with no coordinates
+# indefinitely, and every one of those with no other location signal in
+# its own text (city/area naming a settlement/municipality this project
+# doesn't otherwise recognize) silently piled up in the site's "Others"
+# province bucket, live-reported as a real bug ("all properties in it
+# should be allocated in one of the provinces"). Scheduled hourly now,
+# matching the other backfills, so this actually clears over time instead
+# of sitting still - each newly-geocoded listing gets its real province
+# for free via the existing lat/lng-to-oblast-polygon lookup, no separate
+# fix needed on the classification side once coordinates exist.
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: backfill-geocode-homes
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # scraper_homes.py pulls in geo_utils.py, which imports bs4 at
+      # module load even though this backfill never parses HTML itself -
+      # omitting it crashes every run.
+      - run: pip install requests beautifulsoup4
+
+      # Data lives in the data-store release (not in git): see apps/scraper/data_store.py
+      - id: pull
+        run: python apps/scraper/data_store.py pull @homes @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: python apps/scraper/backfill_geocode_homes.py
+        timeout-minutes: 45
+
+      # Per-run backup of what this run pulled + wrote (the release only keeps the latest copy).
+      - if: always() && steps.pull.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup-${{ github.run_id }}
+          path: |
+            data/*.json*
+            !data/bg_*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Replaces the old git add/commit/rebase/push block: data_store.py merges history files if another
+      # workflow uploaded in between, skips files that did not change, and fails loudly with the HTTP body.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/data_store.py push @homes @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

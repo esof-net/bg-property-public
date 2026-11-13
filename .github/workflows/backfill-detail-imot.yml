@@ -1,0 +1,94 @@
+# NOTE (data-store migration): data now moves through apps/scraper/data_store.py (GitHub Release assets), not git. Comments
+# below that mention git push / rebase / "ours" describe the OLD mechanism and are kept only as history.
+# Fills in description for imot.bg listings the main scrape never visits
+# the detail page for (see backfill_detail_imot.py and scraper_imot.py's
+# fetch_listing_detail() for why: the grid crawl only ever fetched search
+# result pages, never individual listings - the real description only
+# lives on each listing's own page). Runs hourly like the other detail
+# backfills - a fresh full backlog (~21,700 listings) clears over about
+# two days at this run's cap, after which each run only needs to keep up
+# with that day's newly-discovered listings. Own dedicated concurrency
+# group, not shared with scrape.yml or the other backfills - a shared
+# group only ever keeps one *queued* run, so with this many hourly-ish
+# backfill/geocode workflows funneling into one slot, a later schedule
+# firing while an earlier one was still queued canceled it outright
+# rather than just delaying it (confirmed live: runs were being canceled
+# every few minutes). Any git push race with a concurrent scrape/backfill
+# is handled by the rebase-retry fallback below - a real merge for
+# data/history*.json(.gz), see merge_history_conflict.py - not the old
+# keep-one-side-only "ours" fallback that used to silently discard this
+# run's own scraped description on every conflict against scrape.yml's
+# own 6-hourly runs (see docs/backlog.md item 3's addendum: this was one
+# of several detail-backfill workflows never upgraded when alo.bg/
+# homes.bg/imoti.net's own versions of this bug were fixed).
+name: Backfill imot.bg listing details
+
+on:
+  schedule:
+    - cron: "20 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: backfill-detail-imot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests beautifulsoup4 playwright
+
+      # Data lives in the data-store release (not in git): see apps/scraper/data_store.py
+      - id: pull
+        run: python apps/scraper/data_store.py pull @imot @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Retried up to 3 times - live-found: dl.google.com (the Chrome APT repo
+      # playwright's --with-deps pulls Chromium's system dependencies from)
+      # served a corrupted package index ("Hash Sum mismatch") for about 20
+      # minutes on 2026-09-09, failing every workflow that happened to
+      # install Chromium in that window even though nothing on our side was
+      # wrong - the very next scheduled run of each, unchanged, succeeded
+      # once Google's mirror caught up. A short retry rides out exactly
+      # that kind of brief upstream inconsistency instead of failing the
+      # whole run over it.
+      - run: |
+          for attempt in 1 2 3; do
+            if playwright install --with-deps chromium; then
+              exit 0
+            fi
+            echo "playwright install failed (attempt $attempt/3) - likely a transient apt mirror issue, retrying"
+            sleep $((attempt * 10))
+          done
+          echo "::error::playwright install --with-deps chromium failed after 3 attempts"
+          exit 1
+
+      - run: python apps/scraper/backfill_detail_imot.py
+        timeout-minutes: 45
+
+      # Per-run backup of what this run pulled + wrote (the release only keeps the latest copy).
+      - if: always() && steps.pull.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup-${{ github.run_id }}
+          path: |
+            data/*.json*
+            !data/bg_*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Replaces the old git add/commit/rebase/push block: data_store.py merges history files if another
+      # workflow uploaded in between, skips files that did not change, and fails loudly with the HTTP body.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/data_store.py push @imot @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

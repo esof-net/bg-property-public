@@ -1,0 +1,184 @@
+# NOTE (data-store migration): data now moves through apps/scraper/data_store.py (GitHub Release assets), not git. Comments
+# below that mention git push / rebase / "ours" describe the OLD mechanism and are kept only as history.
+# scraper.py (imoti.net) and scraper_alo.py (alo.bg) run separately in
+# scrape-large.yml on a 24h schedule instead of here - both sites have
+# ~10,000 listings across 300+ pages, so a full scrape run of either takes
+# several minutes, too slow/heavy to bundle into this 6-hourly job.
+name: Scrape property listings
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+# A manual workflow_dispatch run overlapping the scheduled run raced to push
+# to the same data/*.json files - the loser's "git pull --rebase" hit real
+# content conflicts (both runs touch the same history files) and its entire
+# push was lost, discarding every scraper's update for that run, not just
+# whichever one happened to conflict. Queues instead of running two scrapes
+# in parallel; cancel-in-progress stays false so a scrape already underway
+# finishes rather than being killed mid-run and wasting the work done so far.
+#
+# Its own dedicated group, not the ~10 hourly backfill/geocode crons'
+# shared "scrape-property-listings" one: this job (~3+ hours, once every
+# 6h) kept getting bumped from that shared queue before it ever started -
+# a newer hourly cron always arrived to displace it while it waited behind
+# whichever job was currently running, so it went from Sep 3 to Sep 5
+# without a single successful run (confirmed via workflow run history).
+# The commit step's own conflict fallback below (keep main's version of
+# just the conflicted file) already covers the actual data-safety concern
+# a shared group was protecting against - the group only added scheduling
+# unfairness on top of that, with no correctness benefit left to lose.
+concurrency:
+  group: scrape-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  # One job per portal, in parallel (they used to run back to back in one ~3.5h job). Each job pulls only its own
+  # portal's files from the data-store release, scrapes, and pushes them straight back, so a slow portal (bazar.bg) no
+  # longer holds the others' data hostage, and a failure in one cannot lose another's scrape.
+  #
+  # Failure semantics are unchanged from the single-job version: every portal except olx.bg keeps continue-on-error
+  # (a crash must not turn the run red / email the owner for a portal that self-heals next cycle), and olx.bg is
+  # deliberately allowed to fail the run (docs/backlog.md item 30: its masked timeouts went unnoticed before).
+  scrape:
+    name: scrape ${{ matrix.portal }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Nationwide since 2026-08-25: homes.bg/imot.bg (24 cities), olx.bg (26 oblasts), bazar.bg (29 cities)
+          # are each sliced and paginated, so these caps are generous multiples of normal runtime. olx.bg's grid
+          # crawl is checkpointed/deadline-aware (50-minute internal budget under its 60-minute cap, rotating its
+          # start oblast); bazar.bg's detail fetching lives in backfill-detail-bazar.yml; bcpea's in
+          # backfill-detail-bcpea.yml.
+          - { portal: homes, script: scraper_homes.py, timeout: 60 }
+          - { portal: imot, script: scraper_imot.py, timeout: 60 }
+          - { portal: olx, script: scraper_olx.py, timeout: 60 }
+          - { portal: bazar, script: scraper_bazar.py, timeout: 90 }
+          - { portal: imoti_bg, script: scraper_imoti_bg.py, timeout: 60 }
+          - { portal: bcpea, script: scraper_bcpea.py, timeout: 30 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests beautifulsoup4 playwright
+      # Retried up to 3 times - live-found: dl.google.com (the Chrome APT repo playwright's --with-deps pulls
+      # Chromium's system dependencies from) served a corrupted package index ("Hash Sum mismatch") for about 20
+      # minutes on 2026-09-09, failing every workflow that installed Chromium in that window. A short retry rides
+      # out that kind of brief upstream inconsistency.
+      - run: |
+          for attempt in 1 2 3; do
+            if playwright install --with-deps chromium; then
+              exit 0
+            fi
+            echo "playwright install failed (attempt $attempt/3) - likely a transient apt mirror issue, retrying"
+            sleep $((attempt * 10))
+          done
+          echo "::error::playwright install --with-deps chromium failed after 3 attempts"
+          exit 1
+
+      # Data lives in the data-store release (not in git): see apps/scraper/data_store.py
+      - id: pull
+        run: python apps/scraper/data_store.py pull @${{ matrix.portal }} @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: scraper
+        run: python apps/scraper/${{ matrix.script }}
+        timeout-minutes: ${{ matrix.timeout }}
+        continue-on-error: ${{ matrix.portal != 'olx' }}
+
+      # Per-run backup of what this run pulled + wrote (the release only keeps the latest copy).
+      - if: always() && steps.pull.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup-${{ matrix.portal }}-${{ github.run_id }}
+          path: |
+            data/*.json*
+            !data/bg_*.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Replaces the git add/commit/rebase/push block. if: always(): push whatever is on disk even when the scraper
+      # step failed or timed out - a partial crawl's progress (e.g. olx.bg's checkpointed grid) is worth keeping.
+      # Backfill workflows write these same files hourly, so push merges history files if the release moved.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/data_store.py push @${{ matrix.portal }} @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Cross-portal work that needs everything the portal jobs just pushed.
+  publish:
+    needs: scrape
+    # Runs even when a portal job failed (the others' data is still worth syncing); not when the run was cancelled.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests beautifulsoup4
+
+      - id: pull
+        run: python apps/scraper/data_store.py pull --all
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Chains newly-detected relistings (a seller deleting and reposting, often at a lower price). Purely local
+      # analysis of the history files pulled above; already-recorded pairs are skipped, so safe every run.
+      - if: steps.pull.outcome == 'success'
+        run: python apps/scraper/detect_relistings.py
+        timeout-minutes: 10
+        continue-on-error: true
+
+      # Precomputes home_stats.json + area_index.json (Home page counts and area dropdown) from the leads files.
+      # Local-only; continue-on-error so a failure can never block pushing the relisting changes - the site falls
+      # back to its full load when the file is missing or stale.
+      - if: steps.pull.outcome == 'success'
+        run: python apps/scraper/build_home_stats.py
+        timeout-minutes: 10
+        continue-on-error: true
+
+      - if: always() && steps.pull.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup-publish-${{ github.run_id }}
+          path: |
+            data/*.json*
+            !data/bg_*.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Only history files (detect_relistings.py injects snapshots there) and the stats are changed here; unchanged
+      # files are skipped by the sha256 check, so listing every history file is free.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/data_store.py push @all-history @home-stats
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Reads all 8 leads files from disk (the pull above, i.e. what the portal jobs pushed), since the cross-portal
+      # merge needs the full picture. The release stays the source of truth whether or not this step succeeds.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/sync_to_supabase.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+
+      # docs/backlog.md's 2026-09-24 incident: scheduled runs failed at the commit/push step with no visible signal,
+      # because continue-on-error on every scraper step meant the run's own conclusion never reflected it. This
+      # checks that fresh data actually landed for the 6 portals this workflow owns, and deliberately has no
+      # continue-on-error, so real staleness turns the run red. Runs last, after the pushes above, so it checks the
+      # state that really reached the data store. See check_scrape_freshness.py for thresholds (calibrated per portal).
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/check_scrape_freshness.py homes imot olx bazar imoti_bg bcpea

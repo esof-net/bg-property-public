@@ -1,0 +1,151 @@
+# NOTE (data-store migration): data now moves through apps/scraper/data_store.py (GitHub Release assets), not git. Comments
+# below that mention git push / rebase / "ours" describe the OLD mechanism and are kept only as history.
+# scraper.py (imoti.net) and scraper_alo.py (alo.bg) each cover thousands
+# of listings across 300+ paginated requests, so they run here on their
+# own 24h schedule instead of in the main 6-hourly scrape.yml. Both used to
+# also visit every tracked listing's own page once per run inline (for a
+# real posted/updated date) - at nationwide scale that made scraper.py
+# alone exceed even this workflow's 300-minute step timeout for real,
+# discarding that whole run's freshly-scraped grid data too (nothing gets
+# saved until after the detail pass finishes). Both are now decoupled the
+# same way homes.bg's/imot.bg's/olx.bg's own detail work already was - see
+# backfill-detail-imoti-net.yml/backfill-detail-alo.yml - so a run here
+# should now be back down to however long the grid crawl alone takes, not
+# multi-hour; each scraper step below still carries a generous
+# timeout-minutes (see that step's own comment) as a backstop against a
+# genuinely hung request, not a tight bound on the expected runtime.
+name: Scrape large property listing sites
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+# Its own dedicated group, decoupled from both scrape.yml's "scrape-main"
+# and the ~10 hourly backfill/geocode crons' shared "scrape-property-
+# listings": this job kept getting bumped from that shared queue before it
+# ever started (0 successful runs from Sep 1 to Sep 5, confirmed via
+# workflow run history) - a newer hourly cron always displaced it while it
+# waited behind whichever job was currently running.
+#
+# Correction (2026-09-22, docs/backlog.md item 3): the claim that used to
+# be here - that scraper.py/scraper_alo.py's files are "disjoint from
+# every file scrape.yml or any hourly backfill writes" - was wrong.
+# backfill-detail-alo.yml runs hourly and writes to these exact same
+# data/leads_alo.json/data/history_alo.json files, so a real content
+# conflict here against that workflow's own concurrent commits isn't a
+# rare edge case, it's near-daily - confirmed live as the actual root
+# cause of alo.bg's grid crawl looking "dead" for 6 days: the conflict
+# fallback below used to be `git checkout --ours`, which during an active
+# `git rebase` keeps the *upstream* (main's) version, not this run's own -
+# so every one of those near-daily conflicts silently discarded this run's
+# freshly-scraped data/history_alo.json. See merge_history_conflict.py's
+# docstring and docs/decisions.md's 2026-09-22 entry for the full story
+# and the actual fix (a real merge for data/history*.json instead of
+# discarding a side) - this comment is being corrected rather than removed
+# so the wrong assumption doesn't get re-introduced without someone
+# reading why it's wrong.
+concurrency:
+  group: scrape-large
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests beautifulsoup4 Pillow
+
+      # Data lives in the data-store release (not in git): see apps/scraper/data_store.py. All of it: Home stats and
+      # the Supabase sync need every portal's leads, not just this workflow's two.
+      - id: pull
+        run: python apps/scraper/data_store.py pull --all
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # These two scrapers are multi-hour by design (see the file header),
+      # so timeout-minutes here is deliberately generous - not a tight
+      # bound like scrape.yml's, just a backstop so a genuinely hung
+      # request (not just normal multi-hour pagination) doesn't consume
+      # the entire 6h job with nothing left for the other scraper or the
+      # commit step. continue-on-error means a timeout/crash on one still
+      # lets the other, and the commit/sync steps, run - same reasoning as
+      # scrape.yml, which hit this for real (a single scraper's crash
+      # skipped every step after it, discarding every other portal's
+      # already-scraped data for that run too).
+      - run: python apps/scraper/scraper.py
+        timeout-minutes: 300
+        continue-on-error: true
+
+      - run: python apps/scraper/scraper_alo.py
+        timeout-minutes: 300
+        continue-on-error: true
+
+      # Extends detect_relistings.py's relisting-chain mechanism (already
+      # wired into scrape.yml) to these two portals specifically, using
+      # real photo comparison instead of URL matching since imoti.net's
+      # and alo.bg's stored photo URLs can't be string-matched (see
+      # detect_relistings_by_photo.py's docstring). Downloads only a
+      # locally-narrowed candidate set's photos, not the full active pool.
+      - run: python apps/scraper/detect_relistings_by_photo.py
+        timeout-minutes: 30
+        continue-on-error: true
+
+      # See scrape.yml: precomputes the Home page's data/home_stats.json +
+      # data/area_index.json before the commit step so they ship with this
+      # run's data. Local-only and non-blocking.
+      - run: python apps/scraper/build_home_stats.py
+        timeout-minutes: 10
+        continue-on-error: true
+
+      # Per-run backup of what this run pulled + wrote (the release only keeps the latest copy).
+      - if: always() && steps.pull.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup-${{ github.run_id }}
+          path: |
+            data/*.json*
+            !data/bg_*.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Replaces the git add/commit/rebase/push block. This run owns imoti.net + alo.bg and the Home stats; a run
+      # takes 2+ hours, so another workflow changing these files meanwhile is likely - data_store.py push merges
+      # history files (nothing from either side is discarded) and keeps the remote copy of derived files.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/data_store.py push @net @alo @home-stats @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Runs last, after the JSON commit/push above has already landed -
+      # JSON stays the source of truth and safety net regardless of
+      # whether this step succeeds. Reads all 8 leads_*.json files
+      # currently on disk (this run's freshly-scraped imoti.net/alo.bg
+      # data plus whatever was last committed for the portals scrape.yml
+      # owns), since the cross-portal merge needs the full picture, not
+      # just what this particular workflow scraped.
+      - if: always()
+        run: python apps/scraper/sync_to_supabase.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+
+      # Deliberately NOT continue-on-error and NOT feeding into whether
+      # earlier steps' data reaches Supabase (this runs last, after
+      # sync_to_supabase.py, and doesn't gate it) - its only job is making
+      # sure a staleness event like alo.bg's (docs/backlog.md item 3) makes
+      # this workflow run itself report red instead of looking identical to
+      # a normal day, which continue-on-error on the scraper steps plus
+      # if: always() on the commit step otherwise guarantees it never does.
+      # See check_scrape_freshness.py's own docstring for what it checks
+      # and why.
+      - if: always()
+        run: python apps/scraper/check_scrape_freshness.py alo ""

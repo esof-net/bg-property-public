@@ -1,0 +1,78 @@
+# NOTE (data-store migration): data now moves through apps/scraper/data_store.py (GitHub Release assets), not git. Comments
+# below that mention git push / rebase / "ours" describe the OLD mechanism and are kept only as history.
+# Fills in lat/lng for imot.bg listings the nationwide scraper left
+# uncoordinated (see backfill_geocode_imot.py and scraper_imot.py's
+# module docstring for why: live geocoding at nationwide scale doesn't fit
+# in the scrape itself). Each run processes a bounded chunk
+# (MAX_LOOKUPS_PER_RUN), not everything at once. Own dedicated
+# concurrency group, not shared with scrape.yml or the other backfills -
+# a shared group only ever keeps one *queued* run, so with this many
+# hourly-ish backfill/geocode workflows funneling into one slot, a later
+# schedule firing while an earlier one was still queued canceled it
+# outright rather than just delaying it (confirmed live: runs were being
+# canceled every few minutes). Any git push race with a concurrent
+# scrape/backfill is handled by the rebase-retry fallback below - a real
+# merge for data/history*.json(.gz), see merge_history_conflict.py - not
+# the old keep-one-side-only "ours" fallback that used to silently
+# discard this run's own geocoded lat/lng on every conflict against
+# scrape.yml's own 6-hourly runs (see docs/backlog.md item 3's addendum:
+# this was one of several backfill workflows never upgraded when
+# alo.bg/homes.bg/imoti.net's own versions of this bug were fixed).
+#
+# Was workflow_dispatch-only - never actually re-run by hand at any real
+# volume, contributing to the site's "Others" province bucket (same root
+# cause as backfill-geocode-homes.yml - see its own comment for the full
+# story). Scheduled hourly now, matching the other backfills.
+on:
+  schedule:
+    - cron: "35 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: backfill-geocode-imot
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # scraper_imot.py imports playwright and bs4 at module load even
+      # though this backfill never launches a browser - omitting either
+      # crashes every run.
+      - run: pip install requests beautifulsoup4 playwright
+
+      # Data lives in the data-store release (not in git): see apps/scraper/data_store.py
+      - id: pull
+        run: python apps/scraper/data_store.py pull @imot @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: python apps/scraper/backfill_geocode_imot.py
+        timeout-minutes: 45
+
+      # Per-run backup of what this run pulled + wrote (the release only keeps the latest copy).
+      - if: always() && steps.pull.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup-${{ github.run_id }}
+          path: |
+            data/*.json*
+            !data/bg_*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Replaces the old git add/commit/rebase/push block: data_store.py merges history files if another
+      # workflow uploaded in between, skips files that did not change, and fails loudly with the HTTP body.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/data_store.py push @imot @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

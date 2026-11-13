@@ -1,0 +1,73 @@
+# NOTE (data-store migration): data now moves through apps/scraper/data_store.py (GitHub Release assets), not git. Comments
+# below that mention git push / rebase / "ours" describe the OLD mechanism and are kept only as history.
+# Fills in description for homes.bg listings - docs/backlog.md item 9d.
+# homes.bg is this site's single largest portal by active listings and had
+# a flat, confirmed 0% real-description rate: PR #217 correctly stopped
+# scraper_homes.py's grid crawl writing a construction-material tag line as
+# if it were a real description, but nothing was ever built to backfill a
+# real one in its place - every other large portal already has its own
+# backfill_detail_*.py doing exactly that (see backfill_detail_homes.py and
+# scraper_homes.py's fetch_listing_detail() for the full search order this
+# uses). Runs hourly like the other detail backfills - a fresh full backlog
+# (~67,000 listings) clears in roughly a day and a half at this run's cap,
+# after which each run only needs to keep up with that day's newly-
+# discovered listings. Own dedicated concurrency group, not shared with
+# scrape.yml or the other backfills - a shared group only ever keeps one
+# *queued* run, so with this many hourly-ish backfill/geocode workflows
+# funneling into one slot, a later schedule firing while an earlier one was
+# still queued canceled it outright rather than just delaying it (confirmed
+# live on the other backfills: runs were being canceled every few minutes).
+# Any git push race with a concurrent scrape/backfill is already handled by
+# the rebase-retry-with-ours fallback below, same as always.
+name: Backfill homes.bg listing details
+
+on:
+  schedule:
+    - cron: "10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: backfill-detail-homes
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests beautifulsoup4
+
+      # Data lives in the data-store release (not in git): see apps/scraper/data_store.py
+      - id: pull
+        run: python apps/scraper/data_store.py pull @homes @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: python apps/scraper/backfill_detail_homes.py
+        timeout-minutes: 45
+
+      # Per-run backup of what this run pulled + wrote (the release only keeps the latest copy).
+      - if: always() && steps.pull.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup-${{ github.run_id }}
+          path: |
+            data/*.json*
+            !data/bg_*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Replaces the old git add/commit/rebase/push block: data_store.py merges history files if another
+      # workflow uploaded in between, skips files that did not change, and fails loudly with the HTTP body.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/data_store.py push @homes @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,79 @@
+# NOTE (data-store migration): data now moves through apps/scraper/data_store.py (GitHub Release assets), not git. Comments
+# below that mention git push / rebase / "ours" describe the OLD mechanism and are kept only as history.
+# One-time correction pass (see backfill_others_alo_detail.py's own
+# docstring for the full story): visits the detail page of every alo.bg
+# listing currently in the site's "Others" province bucket to get its
+# real per-listing coordinate - the one location signal these specific
+# listings have (their own grid card never matched LOCATION_RE, and their
+# city/area fields are just the generic "Bulgaria" fallback).
+#
+# workflow_dispatch only - a one-time catch-up job for the specific
+# backlog reported live ("all of them need allocation, not just half").
+# A long timeout since ~6,500 listings at ~1-2s/request (plain HTTP, not
+# a browser - alo.bg's own detail pages don't need Playwright)
+# realistically takes hours; progress is checkpointed every 200 listings
+# so a run that hits this timeout still keeps whatever it found rather
+# than losing it all.
+#
+# Its own dedicated group, not scrape.yml's shared "scrape-property-
+# listings" one: this script DOES genuinely overlap scrape-large.yml's
+# own alo.bg data (both touch leads_alo.json/history_alo.json), so it
+# should still wait for any scrape-large.yml run in progress specifically
+# - but the ~10 OTHER crons sharing that one group (none of which touch
+# alo.bg's files at all) kept bumping this job from the queue before it
+# ever got a turn, real starvation on a job the live report needs done
+# now (see backfill-others-geocode.yml's own comment for the fuller
+# story). Its commit step below rebases against main and, on a genuine
+# conflict, keeps main's version of just the conflicted files rather than
+# failing outright - the real protection against the one overlap that
+# does exist (a scrape-large.yml run landing mid-way through this one).
+name: Backfill province allocation for "Others" (alo.bg detail visits)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: backfill-others-alo-detail
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests beautifulsoup4
+
+      # Data lives in the data-store release (not in git): see apps/scraper/data_store.py
+      - id: pull
+        run: python apps/scraper/data_store.py pull @alo @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: python apps/scraper/backfill_others_alo_detail.py
+        timeout-minutes: 340
+
+      # Per-run backup of what this run pulled + wrote (the release only keeps the latest copy).
+      - if: always() && steps.pull.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup-${{ github.run_id }}
+          path: |
+            data/*.json*
+            !data/bg_*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Replaces the old git add/commit/rebase/push block: data_store.py merges history files if another
+      # workflow uploaded in between, skips files that did not change, and fails loudly with the HTTP body.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/data_store.py push @alo @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

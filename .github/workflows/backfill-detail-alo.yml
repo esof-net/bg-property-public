@@ -1,0 +1,73 @@
+# NOTE (data-store migration): data now moves through apps/scraper/data_store.py (GitHub Release assets), not git. Comments
+# below that mention git push / rebase / "ours" describe the OLD mechanism and are kept only as history.
+# Fills in site_updated_at/lat,lng/category for alo.bg listings the
+# nationwide scraper left unenriched (see backfill_detail_alo.py and
+# scraper_alo.py's module docstring for why: visiting every listing's own
+# page no longer fits in the main scrape at nationwide scale, ~156,000
+# listings). Unlike the geocode backfills (workflow_dispatch only, re-run
+# by hand), this runs hourly - a fresh full backlog is roughly 1,000
+# listings/run x 24 runs/day, ~a week to fully clear, and after that each
+# run only needs to keep up with each day's newly-discovered listings, a
+# much smaller number. Own dedicated concurrency group, not shared with
+# scrape.yml or the other backfills - a shared group only ever keeps one
+# *queued* run, so with this many hourly-ish backfill/geocode workflows
+# funneling into one slot, a later schedule firing while an earlier one
+# was still queued canceled it outright rather than just delaying it
+# (confirmed live: runs were being canceled every few minutes). Any git
+# push race with a concurrent scrape/backfill is handled by the
+# rebase-retry fallback below - a real merge for data/history*.json (see
+# merge_history_conflict.py), the old keep-one-side-only behavior for
+# anything else (now logged loudly, not silently - see docs/backlog.md
+# item 3 for why that mattered here specifically).
+name: Backfill alo.bg listing details
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: backfill-detail-alo
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests beautifulsoup4
+
+      # Data lives in the data-store release (not in git): see apps/scraper/data_store.py
+      - id: pull
+        run: python apps/scraper/data_store.py pull @alo @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: python apps/scraper/backfill_detail_alo.py
+        timeout-minutes: 45
+
+      # Per-run backup of what this run pulled + wrote (the release only keeps the latest copy).
+      - if: always() && steps.pull.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-backup-${{ github.run_id }}
+          path: |
+            data/*.json*
+            !data/bg_*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Replaces the old git add/commit/rebase/push block: data_store.py merges history files if another
+      # workflow uploaded in between, skips files that did not change, and fails loudly with the HTTP body.
+      - if: always() && steps.pull.outcome == 'success'
+        run: python apps/scraper/data_store.py push @alo @geocode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

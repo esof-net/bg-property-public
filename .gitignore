@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+node_modules/
+dist/
+.env
+.idea/
+dist-*/
+
+# Scraper state lives in the data-store GitHub Release (apps/scraper/data_store.py), never in git.
+# Only the static reference files data/bg_*.json stay tracked. (Files already tracked need `git rm --cached` once.)
+data/history*.json
+data/history*.json.gz
+data/leads*.json
+data/leads*.json.gz
+data/*_grid_state.json
+data/geocode_cache.json
+data/home_stats.json
+data/area_index.json
+data/.store_manifest.json
+data/remote-*
+data/*.part
