@@ -160,10 +160,11 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # Only history files (detect_relistings.py injects snapshots there) and the stats are changed here; unchanged
-      # files are skipped by the sha256 check, so listing every history file is free.
+      # detect_relistings.py injects snapshots into the history files AND regenerates leads_*.json(.gz) for every portal
+      # where it chained a relisting, and build_home_stats.py rewrites the stats, so all three groups are pushed.
+      # Unchanged files are skipped by the sha256 check, so listing every file is free.
       - if: always() && steps.pull.outcome == 'success'
-        run: python apps/scraper/data_store.py push @all-history @home-stats
+        run: python apps/scraper/data_store.py push @all-history @all-leads @home-stats
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

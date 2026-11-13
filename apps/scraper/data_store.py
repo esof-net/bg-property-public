@@ -28,6 +28,8 @@ import json
 import os
 import sys
 import time
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -39,7 +41,9 @@ from paths import DATA_DIR  # noqa: E402
 DEFAULT_REPO = "esof-net/bg-property-public"
 DEFAULT_TAG = "data-store"
 MANIFEST_NAME = ".store_manifest.json"
-TMP_MARKER = ".uploading-"  # temp asset names: <name>.uploading-<run id>
+TMP_MARKER = ".uploading-"  # temp asset names: <name>.uploading-<run id>-<8 hex>, unique per upload attempt
+STALE_TMP_AGE = timedelta(hours=2)  # an .uploading-* asset older than this is an orphan from a killed run
+RENAME_RETRIES = 3
 MAX_ASSET_BYTES = 2 * 1024 ** 3  # GitHub's per-asset limit
 MAX_PUSH_ATTEMPTS = 5
 API = "https://api.github.com"
@@ -48,6 +52,11 @@ UPLOADS = "https://uploads.github.com"
 
 class StoreError(RuntimeError):
     pass
+
+
+class StoreConflict(StoreError):
+    """Another workflow replaced the asset while we were uploading. Nothing of ours was lost (the file is still on disk),
+    the temp upload has been cleaned up, and push() re-lists, merges and retries."""
 
 
 # One place that knows which files belong to which portal. Workflows say `@homes` instead of listing files.
@@ -108,6 +117,8 @@ class GitHubStore:
         self.repo, self.tag, self.token = repo, tag, token
         self.session = session or requests.Session()
         self._release_id = None
+        self._my_tmps = set()  # temp asset names this process created and has not yet renamed or discarded
+        self.sleep = time.sleep
 
     def _headers(self, accept="application/vnd.github+json"):
         h = {"Accept": accept, "X-GitHub-Api-Version": "2022-11-28"}
@@ -122,9 +133,9 @@ class GitHubStore:
         self._release_id = data["id"]
         return data
 
-    def list_assets(self):
-        """name -> {id, name, updated_at, size}; temp upload leftovers are hidden."""
-        assets = {}
+    def _raw_assets(self):
+        """Every asset of the release, temp uploads included."""
+        out = []
         page = 1
         rel = self._release()
         # the release payload carries at most 30 assets; page through the assets endpoint for the full list
@@ -132,12 +143,42 @@ class GitHubStore:
             r = _check(self.session.get(f"{API}/repos/{self.repo}/releases/{rel['id']}/assets", headers=self._headers(),
                                         params={"per_page": 100, "page": page}, timeout=60), "list release assets")
             batch = r.json()
-            for a in batch:
-                if TMP_MARKER not in a["name"]:
-                    assets[a["name"]] = {k: a[k] for k in ("id", "name", "updated_at", "size")}
+            out.extend({k: a[k] for k in ("id", "name", "updated_at", "size")} for a in batch)
             if len(batch) < 100:
-                return assets
+                return out
             page += 1
+
+    def list_assets(self):
+        """name -> {id, name, updated_at, size}; temp upload leftovers are hidden."""
+        return {a["name"]: a for a in self._raw_assets() if TMP_MARKER not in a["name"]}
+
+    def _discard(self, asset_id, tmp_name):
+        """Best-effort delete of a temp upload; a failure here must never mask the error being handled."""
+        self._my_tmps.discard(tmp_name)
+        try:
+            self.session.delete(f"{API}/repos/{self.repo}/releases/assets/{asset_id}", headers=self._headers(), timeout=60)
+        except requests.RequestException as e:
+            print(f"::warning::could not delete temp asset {tmp_name}: {e}")
+
+    def _sweep_tmp(self, name):
+        """Remove <name>.uploading-* orphans: ones this process left behind, or any older than STALE_TMP_AGE (a killed run).
+        A fresh temp of another run may be a live upload, so it is left alone (matrix jobs of one run share a run id, so
+        the run id cannot identify 'ours'). Never lets a sweep problem fail the upload."""
+        prefix = name + TMP_MARKER
+        try:
+            now = datetime.now(timezone.utc)
+            for a in self._raw_assets():
+                if not a["name"].startswith(prefix):
+                    continue
+                try:
+                    age = now - datetime.fromisoformat(a["updated_at"].replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    age = timedelta(0)
+                if a["name"] in self._my_tmps or age > STALE_TMP_AGE:
+                    print(f"sweeping orphaned temp asset {a['name']}")
+                    self._discard(a["id"], a["name"])
+        except (StoreError, requests.RequestException) as e:
+            print(f"::warning::temp-asset sweep for {name} skipped: {e}")
 
     def download(self, asset, dest):
         url = f"{API}/repos/{self.repo}/releases/assets/{asset['id']}"
@@ -150,21 +191,56 @@ class GitHubStore:
         os.replace(tmp, dest)
 
     def upload_replace(self, name, path, old_asset, run_id="local"):
-        """Upload under a temp name, delete the old asset, rename: the window with no asset is as short as possible."""
+        """Replace asset `name` with the file at `path` and return the NEW asset ({id, name, updated_at, size}), taken from
+        the rename response so it identifies our upload by id (a later listing could show another workflow's asset).
+
+        Upload under a unique temp name, delete the old asset (by id, never by name), rename the temp to `name`. Every
+        failure path cleans up so a retry cannot be blocked by our own leftovers:
+          - delete-old fails (already replaced by someone): old state intact, temp discarded, StoreConflict;
+          - rename hits an existing name (someone else won the race): temp discarded, StoreConflict;
+          - rename keeps failing after the old asset is gone: the temp is KEPT (it holds the only copy of the new data in
+            the release) and the error names it."""
         if self._release_id is None:
             self._release()
-        tmp_name = f"{name}{TMP_MARKER}{run_id}"
+        self._sweep_tmp(name)
+        size = os.path.getsize(path)
+        tmp_name = f"{name}{TMP_MARKER}{run_id}-{uuid.uuid4().hex[:8]}"
         with open(path, "rb") as f:
             r = _check(self.session.post(f"{UPLOADS}/repos/{self.repo}/releases/{self._release_id}/assets",
                                          params={"name": tmp_name}, data=f, timeout=900,
                                          headers={**self._headers(), "Content-Type": "application/octet-stream"}),
                        f"upload {name}")
         new_id = r.json()["id"]
+        self._my_tmps.add(tmp_name)
         if old_asset is not None:
-            _check(self.session.delete(f"{API}/repos/{self.repo}/releases/assets/{old_asset['id']}", headers=self._headers(),
-                                       timeout=60), f"delete old {name}")
-        _check(self.session.patch(f"{API}/repos/{self.repo}/releases/assets/{new_id}", headers=self._headers(),
-                                  json={"name": name}, timeout=60), f"rename {tmp_name} -> {name}")
+            resp = self.session.delete(f"{API}/repos/{self.repo}/releases/assets/{old_asset['id']}", headers=self._headers(), timeout=60)
+            if resp.status_code >= 400:
+                self._discard(new_id, tmp_name)
+                raise StoreConflict(f"delete old {name} failed: HTTP {resp.status_code}: {resp.text[:500]} - replaced by another workflow?")
+        last = None
+        for attempt in range(1, RENAME_RETRIES + 1):
+            resp = self.session.patch(f"{API}/repos/{self.repo}/releases/assets/{new_id}", headers=self._headers(),
+                                      json={"name": name}, timeout=60)
+            if resp.status_code < 400:
+                asset = resp.json()
+                got = {k: asset.get(k) for k in ("id", "name", "updated_at", "size")}
+                if got["name"] != name:
+                    raise StoreError(f"rename {tmp_name} -> {name}: release reports name={got['name']!r}")
+                if got["size"] != size:
+                    # Warn, don't raise: the asset already sits under the real name, so a retry would download it as "the
+                    # remote copy" and overwrite the good local file with it.
+                    print(f"::warning::{name}: release reports {got['size']} bytes but the local file is {size} bytes")
+                self._my_tmps.discard(tmp_name)
+                return got
+            last = resp
+            if resp.status_code == 422:  # name already exists: another workflow created it meanwhile
+                self._discard(new_id, tmp_name)
+                raise StoreConflict(f"rename {tmp_name} -> {name}: name already taken by another workflow (HTTP 422: {resp.text[:500]})")
+            if attempt < RENAME_RETRIES:
+                self.sleep(attempt * 2)
+        raise StoreError(f"rename {tmp_name} -> {name} failed after {RENAME_RETRIES} attempts: HTTP {last.status_code}: "
+                         f"{last.text[:500]}. {name} may be missing from the release; the new content is in asset "
+                         f"{tmp_name} (id {new_id}) - rename it by hand to recover")
 
 
 def load_manifest(data_dir):
@@ -273,15 +349,16 @@ def push(store, names, data_dir=DATA_DIR, run_id="local", sleep=time.sleep):
                 save_manifest(data_dir, manifest)
                 break
             try:
-                store.upload_replace(n, path, remote, run_id=run_id)
+                fresh = store.upload_replace(n, path, remote, run_id=run_id)
             except StoreError as e:
                 print(f"::warning::push {n} attempt {attempt}/{MAX_PUSH_ATTEMPTS}: {e}")
                 if attempt == MAX_PUSH_ATTEMPTS:
                     raise
                 sleep(attempt * 5)
                 continue
-            fresh = store.list_assets().get(n)
-            manifest[n] = {"id": fresh["id"] if fresh else None, "updated_at": fresh["updated_at"] if fresh else None, "sha256": local_sha}
+            # `fresh` is OUR asset as reported by the upload itself. Do not re-list here: another workflow may have
+            # replaced it already, and recording their id/timestamp with our hash would make the next push skip us.
+            manifest[n] = {"id": fresh["id"], "updated_at": fresh["updated_at"], "sha256": local_sha}
             save_manifest(data_dir, manifest)
             uploaded.append(n)
             print(f"pushed {n} ({size / 1e6:.1f} MB)")
