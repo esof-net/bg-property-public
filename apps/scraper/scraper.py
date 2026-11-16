@@ -194,7 +194,12 @@ def smallest_container_with_price(link_tag, max_levels=6):
     return None
 
 
+FORBIDDEN_COUNT = 0  # HTTP 401/403 responses seen this process: a portal blocking this runner's IP shows up here
+FORBIDDEN_EXAMPLE = None
+
+
 def fetch_with_retries(url):
+    global FORBIDDEN_COUNT, FORBIDDEN_EXAMPLE
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -214,6 +219,9 @@ def fetch_with_retries(url):
             if status in (404, 410):
                 print(f"DEBUG: {url} permanently gone ({status}) - not retrying")
                 return None
+            if status in (401, 403):
+                FORBIDDEN_COUNT += 1
+                FORBIDDEN_EXAMPLE = FORBIDDEN_EXAMPLE or url
             print(f"DEBUG: request failed for {url} (attempt {attempt}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
@@ -684,6 +692,16 @@ def compute_leads(history):
 def main():
     listings = fetch_listings()
     history = load_history()
+    if not listings and history:
+        # A blocked/broken crawl must not be saved: update_history/compute_leads would age every tracked listing past
+        # GONE_AFTER (all "removed"), save_history could evict records, and data_store push would persist that. Writing
+        # nothing leaves the files byte-identical, so push skips them and the release keeps its last good copy.
+        # Visible on the run summary without failing the step (it is continue-on-error and a failure e-mails the owner).
+        reason = (f"HTTP 401/403 on {FORBIDDEN_COUNT} requests (first: {FORBIDDEN_EXAMPLE}) - the site is blocking this runner's IP"
+                  if FORBIDDEN_COUNT else "no request was blocked, so check whether the page markup changed")
+        print(f"Found 0 listings, {len(history)} tracked - NOT saving, last good history/leads kept")
+        print(f"::warning::imoti.net: 0 listings crawled while {len(history)} are tracked - data NOT updated. {reason}")
+        return
     history = update_history(history, listings)
     save_history(history)
     leads = compute_leads(history)

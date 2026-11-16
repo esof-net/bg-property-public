@@ -125,6 +125,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # The job is ~4.5 h long and scrape.yml pushes the six other portals meanwhile; re-pull them so the
+      # cross-portal sync never writes an hours-old snapshot over newer Supabase rows. net/alo are left out on
+      # purpose: this run's local copies are the ones just pushed (or kept, if their push failed).
+      - if: always() && steps.pull.outcome == 'success'
+        id: repull
+        run: python apps/scraper/data_store.py pull @homes @imot @olx @bazar @imoti_bg @bcpea
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       # Runs last, after the JSON commit/push above has already landed -
       # JSON stays the source of truth and safety net regardless of
       # whether this step succeeds. Reads all 8 leads_*.json files
@@ -132,7 +142,11 @@ jobs:
       # data plus whatever was last committed for the portals scrape.yml
       # owns), since the cross-portal merge needs the full picture, not
       # just what this particular workflow scraped.
-      - if: always()
+      #
+      # Only after BOTH pulls succeeded (`outcome`, not `conclusion`: repull is continue-on-error, whose conclusion is
+      # always success). A failed pull means the files on disk are stale or absent (the checkout holds none of the
+      # mutable data), and syncing that would overwrite newer Supabase rows. Skipping is safe: the next run syncs.
+      - if: always() && steps.pull.outcome == 'success' && steps.repull.outcome == 'success'
         run: python apps/scraper/sync_to_supabase.py
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -147,5 +161,8 @@ jobs:
       # if: always() on the commit step otherwise guarantees it never does.
       # See check_scrape_freshness.py's own docstring for what it checks
       # and why.
+      #
+      # imoti.net ("") removed from this list on 2026-11-16: it answers HTTP 403 to every GitHub runner request
+      # (scraper.py prints a ::warning:: instead). Re-add once it is unblocked - docs/backlog.md.
       - if: always()
-        run: python apps/scraper/check_scrape_freshness.py alo ""
+        run: python apps/scraper/check_scrape_freshness.py alo
