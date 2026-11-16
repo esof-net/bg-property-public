@@ -303,9 +303,10 @@ def _rebuild_leads(name, path, data_dir):
     try:
         if not history_path.exists():
             return False
-        from detect_relistings import compute_leads  # lazy: pulls in geo_utils, not needed for pull
+        from detect_relistings import LEADS_POSTED_FIELD, compute_leads  # lazy: pulls in geo_utils, not needed for pull
         from geo_utils import load_json_any
-        leads = compute_leads(load_json_any(history_path))
+        # olx / imoti.bg date days_on_market from the listing's own posted date, exactly like their scrapers do
+        leads = compute_leads(load_json_any(history_path), LEADS_POSTED_FIELD.get(name))
         _write_json_text_like(path, leads)
         return True
     except Exception as e:  # never let a rebuild problem fail the push
@@ -313,12 +314,25 @@ def _rebuild_leads(name, path, data_dir):
         return False
 
 
+def _retry(fn, what, attempts=3, sleep=time.sleep):
+    """Call fn(), retrying StoreError (HTTP errors and, via the GitHubStore wrapper, timeouts/resets) with a backoff.
+    For the list/download calls that sit outside the upload retry loops."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except StoreError as e:
+            print(f"::warning::{what} attempt {attempt}/{attempts}: {e}")
+            if attempt == attempts:
+                raise
+            sleep(attempt * 5)
+
+
 def pull(store, names, data_dir=DATA_DIR, retries=3, sleep=time.sleep):
     """Download `names` (or every asset when names is None) into data_dir and record them in the manifest."""
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(data_dir)
-    assets = store.list_assets()
+    assets = _retry(store.list_assets, "pull: list release assets", sleep=sleep)
     wanted = sorted(assets) if names is None else expand(names)
     missing = [n for n in wanted if n not in assets]
     if missing:
@@ -335,7 +349,7 @@ def pull(store, names, data_dir=DATA_DIR, retries=3, sleep=time.sleep):
                 if attempt == retries:
                     raise
                 sleep(attempt * 5)
-                a = store.list_assets().get(n) or a
+                a = _retry(store.list_assets, "pull: re-list release assets", sleep=sleep).get(n) or a
         manifest[n] = {"id": a["id"], "updated_at": a["updated_at"], "sha256": sha256_of(data_dir / n)}
         print(f"pulled {n} ({a['size'] / 1e6:.1f} MB)")
     save_manifest(data_dir, manifest)
@@ -357,7 +371,7 @@ def push(store, names, data_dir=DATA_DIR, run_id="local", sleep=time.sleep):
                 raise StoreError(f"{n} is {size / 1e9:.2f} GB, over GitHub's 2 GB per-asset limit - not uploading")
             local_sha = sha256_of(path)
             seen = manifest.get(n)
-            remote = store.list_assets().get(n)
+            remote = _retry(store.list_assets, f"push {n}: list release assets", sleep=sleep).get(n)
             if seen and seen.get("sha256") == local_sha and remote is not None:
                 print(f"unchanged, skipping {n}")
                 break
@@ -369,7 +383,7 @@ def push(store, names, data_dir=DATA_DIR, run_id="local", sleep=time.sleep):
             if moved:
                 # another workflow replaced it after our pull (or we never pulled it): reconcile, then retry
                 remote_copy = data_dir / ("remote-" + n)  # keep the .gz suffix: _read_text decides by filename
-                store.download(remote, remote_copy)
+                _retry(lambda: store.download(remote, remote_copy), f"push {n}: download remote copy", sleep=sleep)
                 if is_history_file(n):
                     merged = merge_history(_read_text(remote_copy), _read_text(path))
                     _write_json_text_like(path, merged)

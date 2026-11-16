@@ -92,7 +92,7 @@ from paths import DATA_DIR as REPO_DATA_DIR
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
-from geo_utils import Geocoder, classify_category, compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION
+from geo_utils import Geocoder, classify_category, compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION, crawl_looks_truncated
 
 SEARCH_URL = "https://sales.bcpea.org/properties"
 BASE_URL = "https://sales.bcpea.org"
@@ -875,13 +875,14 @@ def compute_leads(history):
 def main():
     listings = fetch_listings()
     history = load_history()
-    if not listings and history:
-        # See scraper.py main(): a zero-listing crawl must not be saved, or every tracked listing is aged to "removed".
+    if history and (not listings or crawl_looks_truncated(history, listings, bool(CHALLENGE_FAILURES), GONE_AFTER)):
+        # See scraper.py main(): a zero-listing crawl, or one cut short by the challenge (blocked AND under half of what
+        # is tracked as active), must not be saved, or every listing it missed is aged to "removed".
         reason = (f"the bot challenge never cleared on {len(CHALLENGE_FAILURES)} page(s) (first: {CHALLENGE_FAILURES[0]}) - "
                   "the site is blocking this runner's IP" if CHALLENGE_FAILURES
                   else "no challenge was seen, so check whether the page markup changed")
-        print(f"Found 0 listings, {len(history)} tracked - NOT saving, last good history/leads kept")
-        print(f"::warning::bcpea.org: 0 listings crawled while {len(history)} are tracked - data NOT updated. {reason}")
+        print(f"Found {len(listings)} listings, {len(history)} tracked - NOT saving, last good history/leads kept")
+        print(f"::warning::bcpea.org: only {len(listings)} listings crawled while {len(history)} are tracked - data NOT updated. {reason}")
         return
     history = update_history(history, listings)
     save_history(history)

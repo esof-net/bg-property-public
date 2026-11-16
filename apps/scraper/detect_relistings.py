@@ -191,7 +191,18 @@ def detect_portal(portal, history_filename, photo_key_fn):
     return injected, False
 
 
-def compute_leads(history):
+# Portals whose own scraper dates days_on_market from the listing's real posted/updated date (a `latest` field) instead
+# of first_seen. compute_leads() must use the same field or a regenerated leads file ranks differently from the scraper's.
+# Keyed by portal for main(), and by leads filename for data_store._rebuild_leads().
+POSTED_FIELD = {"olx.bg": "site_updated_at", "imoti.bg": "site_posted_at"}
+LEADS_POSTED_FIELD = {"leads_olx.json.gz": "site_updated_at", "leads_imoti_bg.json": "site_posted_at"}
+
+
+def compute_leads(history, posted_field=None):
+    # `posted_field`: name of the `latest` field to date days_on_market from (scraper_olx.py: site_updated_at,
+    # scraper_imoti_bg.py: site_posted_at), falling back to first_seen when a record lacks it. None = first_seen, which
+    # is what homes/imot/bazar use.
+    #
     # Duplicated from scraper_imot.py / scraper_bazar.py (identical in both)
     # rather than imported - see backfill_wayback_prices.py for why:
     # importing scraper_imot.py pulls in an unrelated top-level playwright
@@ -207,7 +218,11 @@ def compute_leads(history):
         last_seen = datetime.fromisoformat(rec["snapshots"][-1]["seen_at"])
         source_status = "active" if (datetime.now(timezone.utc) - last_seen) <= GONE_AFTER else "removed"
         effective_now = last_seen if source_status == "removed" else datetime.now(timezone.utc)
-        days_on_market = (effective_now - first_seen).days
+        posted = rec["latest"].get(posted_field) if posted_field else None
+        if posted:
+            days_on_market = max((effective_now - datetime.fromisoformat(posted)).days, 0)
+        else:
+            days_on_market = (effective_now - first_seen).days
 
         price_history = []
         last_hist_price = None
@@ -298,7 +313,7 @@ def main():
         if injected:
             leads_filename = history_filename.replace("history_", "leads_", 1)
             history = load_json_any(DATA_DIR / history_filename)
-            leads = compute_leads(history)
+            leads = compute_leads(history, POSTED_FIELD.get(portal))
             save_json_any(DATA_DIR / leads_filename, leads)
             print(f"  regenerated {leads_filename} ({len(leads)} leads)")
     print(f"\nTotal relistings chained this run: {total}")

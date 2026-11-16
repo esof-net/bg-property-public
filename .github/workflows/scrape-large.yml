@@ -125,12 +125,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # The job is ~4.5 h long and scrape.yml pushes the six other portals meanwhile; re-pull them so the
-      # cross-portal sync never writes an hours-old snapshot over newer Supabase rows. net/alo are left out on
-      # purpose: this run's local copies are the ones just pushed (or kept, if their push failed).
+      # The job is ~4.5 h long, scrape.yml pushes the six other portals meanwhile and the hourly backfills replace
+      # net/alo assets too; re-pull EVERYTHING so the cross-portal sync mirrors the release and never writes an
+      # hours-old snapshot over newer Supabase rows (including when this run's own net/alo push failed).
       - if: always() && steps.pull.outcome == 'success'
         id: repull
-        run: python apps/scraper/data_store.py pull @homes @imot @olx @bazar @imoti_bg @bcpea
+        run: python apps/scraper/data_store.py pull --all
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

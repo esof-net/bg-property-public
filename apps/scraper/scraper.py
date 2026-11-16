@@ -84,7 +84,7 @@ from bs4 import BeautifulSoup
 
 from category_classifier import classify_listing
 from geo_norm import clean_area
-from geo_utils import extract_coords_imoti_net, extract_photos_imoti_net, compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION
+from geo_utils import extract_coords_imoti_net, extract_photos_imoti_net, compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION, crawl_looks_truncated
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; PersonalDealTracker/1.0)"}
 BASE_URL = "https://www.imoti.net/en/obiavi/r/prodava"
@@ -692,15 +692,17 @@ def compute_leads(history):
 def main():
     listings = fetch_listings()
     history = load_history()
-    if not listings and history:
-        # A blocked/broken crawl must not be saved: update_history/compute_leads would age every tracked listing past
-        # GONE_AFTER (all "removed"), save_history could evict records, and data_store push would persist that. Writing
-        # nothing leaves the files byte-identical, so push skips them and the release keeps its last good copy.
+    if history and (not listings or crawl_looks_truncated(history, listings, FORBIDDEN_COUNT > 0, GONE_AFTER)):
+        # A blocked/broken crawl must not be saved: update_history/compute_leads would age every tracked listing it
+        # missed past GONE_AFTER ("removed"), and data_store push would persist that. Either nothing was found, or
+        # requests were blocked AND the crawl is under half of what is tracked as active (a block partway through; one
+        # transient blocked page on a complete crawl is still saved). Writing nothing leaves the files byte-identical,
+        # so push skips them and the release keeps its last good copy.
         # Visible on the run summary without failing the step (it is continue-on-error and a failure e-mails the owner).
         reason = (f"HTTP 401/403 on {FORBIDDEN_COUNT} requests (first: {FORBIDDEN_EXAMPLE}) - the site is blocking this runner's IP"
                   if FORBIDDEN_COUNT else "no request was blocked, so check whether the page markup changed")
-        print(f"Found 0 listings, {len(history)} tracked - NOT saving, last good history/leads kept")
-        print(f"::warning::imoti.net: 0 listings crawled while {len(history)} are tracked - data NOT updated. {reason}")
+        print(f"Found {len(listings)} listings, {len(history)} tracked - NOT saving, last good history/leads kept")
+        print(f"::warning::imoti.net: only {len(listings)} listings crawled while {len(history)} are tracked - data NOT updated. {reason}")
         return
     history = update_history(history, listings)
     save_history(history)
