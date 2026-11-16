@@ -167,6 +167,7 @@ from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
 from category_classifier import classify_listing
+from geo_norm import area_or_city
 from geo_utils import (
     Geocoder, extract_description_imot, extract_photos_imot, compute_motivation_score,
     listing_city_key, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION,
@@ -289,6 +290,8 @@ PRICE_RE = re.compile(r"[\d\s]{3,10}\s?€")
 # query slug (docs/backlog.md item 31), the same reasoning olx.bg's own
 # CITY_AREA_LINE_RE uses.
 CITY_AREA_LINE_RE = re.compile(r"^град\s+(\S.*?),\s*(.+)$")
+# The part after the comma of a "град X, област Y" line: an administrative qualifier, not a quarter
+ADMIN_QUALIFIER_RE = re.compile(r"^(?:област|община)\s", re.IGNORECASE)
 # The comma+area shape above was only live-sampled against big cities
 # (Sofia/Plovdiv/Varna/Burgas), which always have a named quarter. A
 # smaller town's own card may have no comma at all (nothing to name as a
@@ -303,6 +306,25 @@ CITY_ONLY_LINE_RE = re.compile(r"^град\s+(.+)$")
 VILLAGE_LINE_RE = re.compile(r"^с\.\s*(.+)$")
 PRICE_LINE_RE = re.compile(r"^([\d\s]{3,10})\s?€$")
 SQM_RE = re.compile(r"([\d.,]+)\s?кв\.?м")
+
+
+def parse_location_line(line):
+    """(city, area) from one card line, or None when the line is not a location line. The city keeps any "област X" text (it decides
+    oblast_key); the area is cleaned (see geo_norm.clean_area / area_or_city)."""
+    m = CITY_AREA_LINE_RE.match(line)
+    if m:
+        city, area = m.group(1).strip(), m.group(2).strip()
+        if ADMIN_QUALIFIER_RE.match(area):
+            # "град Абланица, област Ловеч": the part after the comma is the oblast, not a quarter. The city keeps the full text; the
+            # area is the settlement itself.
+            city = (city + ", " + area).strip()
+            area = city
+        return city, area_or_city(area, city)
+    m = CITY_ONLY_LINE_RE.match(line) or VILLAGE_LINE_RE.match(line)
+    if m:
+        city = m.group(1).strip()
+        return city, area_or_city(city, city)  # "Абланица, област Ловеч": city keeps the oblast, area is the settlement
+    return None
 
 
 def smallest_container_with_price(link_tag, max_levels=8):
@@ -359,17 +381,9 @@ def parse_listings_page(html, seen, geocoder, query_display):
         city = query_display
         area = query_display
         for l in lines:
-            m = CITY_AREA_LINE_RE.match(l)
-            if m:
-                city, area = m.group(1).strip(), m.group(2).strip()
-                break
-            m2 = CITY_ONLY_LINE_RE.match(l)
-            if m2:
-                city = area = m2.group(1).strip()
-                break
-            m3 = VILLAGE_LINE_RE.match(l)
-            if m3:
-                city = area = m3.group(1).strip()
+            parsed = parse_location_line(l)
+            if parsed:
+                city, area = parsed
                 break
 
         sqm = None
