@@ -1993,21 +1993,25 @@ def evict_stale_records(history, retention=STALE_RECORD_RETENTION, now=None):
 TRUNCATED_CRAWL_RATIO = 0.5
 
 
-def crawl_looks_truncated(history, listings, blocked, gone_after, now=None):
+def crawl_looks_truncated(history, listings, blocked, gone_after):
     """True when requests were blocked (HTTP 401/403 or a bot challenge that never cleared) AND the crawl found fewer
-    than TRUNCATED_CRAWL_RATIO of the listings tracked as active, i.e. last seen within `gone_after`.
+    than TRUNCATED_CRAWL_RATIO of the listings that were alive at the LAST SUCCESSFUL crawl.
 
     Saving such a crawl lets every listing it missed age past `gone_after` and flip to "removed" on a later run, while the
     block lasts. A single transient blocked page on an otherwise complete crawl is NOT truncation: it is saved as usual
-    (anything missed ages out only after `gone_after`, by design). Only records seen within `gone_after` count as active,
-    so a long tail of long-removed records does not make a healthy crawl look small."""
+    (anything missed ages out only after `gone_after`, by design).
+
+    The baseline is measured against the newest last-seen time in the history (when the last good crawl ran), not against
+    now: after an outage longer than `gone_after` nothing is within `gone_after` of now, an "active" count taken against
+    now would be 0, and any blocked partial crawl would pass and be saved. Records last seen more than `gone_after` before
+    that crawl (long-removed ones) are not counted, so a long tail does not make a healthy crawl look small."""
     if not blocked:
         return False
-    now = now or datetime.now(timezone.utc)
-    active = sum(
-        1 for rec in history.values()
-        if rec.get("snapshots") and now - datetime.fromisoformat(rec["snapshots"][-1]["seen_at"]) <= gone_after
-    )
+    last_seen = [datetime.fromisoformat(rec["snapshots"][-1]["seen_at"]) for rec in history.values() if rec.get("snapshots")]
+    if not last_seen:
+        return False
+    reference = max(last_seen)
+    active = sum(1 for t in last_seen if reference - t <= gone_after)
     return len(listings) < active * TRUNCATED_CRAWL_RATIO
 
 
