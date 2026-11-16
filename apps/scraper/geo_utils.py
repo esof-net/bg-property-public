@@ -1988,6 +1988,33 @@ def evict_stale_records(history, retention=STALE_RECORD_RETENTION, now=None):
     return len(stale_ids)
 
 
+# A crawl that saw fewer than this share of the listings currently tracked as active, while the portal also blocked
+# requests, is treated as truncated by the block and is not saved (see crawl_looks_truncated()).
+TRUNCATED_CRAWL_RATIO = 0.5
+
+
+def crawl_looks_truncated(history, listings, blocked, gone_after):
+    """True when requests were blocked (HTTP 401/403 or a bot challenge that never cleared) AND the crawl found fewer
+    than TRUNCATED_CRAWL_RATIO of the listings that were alive at the LAST SUCCESSFUL crawl.
+
+    Saving such a crawl lets every listing it missed age past `gone_after` and flip to "removed" on a later run, while the
+    block lasts. A single transient blocked page on an otherwise complete crawl is NOT truncation: it is saved as usual
+    (anything missed ages out only after `gone_after`, by design).
+
+    The baseline is measured against the newest last-seen time in the history (when the last good crawl ran), not against
+    now: after an outage longer than `gone_after` nothing is within `gone_after` of now, an "active" count taken against
+    now would be 0, and any blocked partial crawl would pass and be saved. Records last seen more than `gone_after` before
+    that crawl (long-removed ones) are not counted, so a long tail does not make a healthy crawl look small."""
+    if not blocked:
+        return False
+    last_seen = [datetime.fromisoformat(rec["snapshots"][-1]["seen_at"]) for rec in history.values() if rec.get("snapshots")]
+    if not last_seen:
+        return False
+    reference = max(last_seen)
+    active = sum(1 for t in last_seen if reference - t <= gone_after)
+    return len(listings) < active * TRUNCATED_CRAWL_RATIO
+
+
 # --- Relisting chain-storm guard ----------------------------------------
 # 2026-09-24 incident: a 3-consecutive-scrape.yml-run commit/push outage
 # (git push rejected with GH001, data/leads_homes.json and data/

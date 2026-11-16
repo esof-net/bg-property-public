@@ -92,7 +92,7 @@ from paths import DATA_DIR as REPO_DATA_DIR
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
-from geo_utils import Geocoder, classify_category, compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION
+from geo_utils import Geocoder, classify_category, compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION, crawl_looks_truncated
 
 SEARCH_URL = "https://sales.bcpea.org/properties"
 BASE_URL = "https://sales.bcpea.org"
@@ -182,6 +182,9 @@ def is_challenge_title(title):
     return any(marker in title for marker in CHALLENGE_TITLE_MARKERS)
 
 
+CHALLENGE_FAILURES = []  # urls whose bot challenge never cleared this run (portal blocking this runner's IP)
+
+
 def fetch_html(browser, url):
     # A fresh browser context per request, not one shared page reused for
     # the whole run - confirmed live via probe_bcpea_challenge.py (4
@@ -208,6 +211,7 @@ def fetch_html(browser, url):
                         print(f"DEBUG: challenge cleared for {url}", flush=True)
                         break
                 else:
+                    CHALLENGE_FAILURES.append(url)
                     print(f"DEBUG: challenge did not clear for {url} after "
                           f"{CHALLENGE_POLL_ATTEMPTS * CHALLENGE_POLL_INTERVAL_MS / 1000:.0f}s", flush=True)
             return page.content()
@@ -871,6 +875,15 @@ def compute_leads(history):
 def main():
     listings = fetch_listings()
     history = load_history()
+    if history and (not listings or crawl_looks_truncated(history, listings, bool(CHALLENGE_FAILURES), GONE_AFTER)):
+        # See scraper.py main(): a zero-listing crawl, or one cut short by the challenge (blocked AND under half of what
+        # is tracked as active), must not be saved, or every listing it missed is aged to "removed".
+        reason = (f"the bot challenge never cleared on {len(CHALLENGE_FAILURES)} page(s) (first: {CHALLENGE_FAILURES[0]}) - "
+                  "the site is blocking this runner's IP" if CHALLENGE_FAILURES
+                  else "no challenge was seen, so check whether the page markup changed")
+        print(f"Found {len(listings)} listings, {len(history)} tracked - NOT saving, last good history/leads kept")
+        print(f"::warning::bcpea.org: only {len(listings)} listings crawled while {len(history)} are tracked - data NOT updated. {reason}")
+        return
     history = update_history(history, listings)
     save_history(history)
     leads = compute_leads(history)

@@ -47,7 +47,7 @@ from geo_utils import (
     _looks_like_title_echo,
     bcpea_settlement_from_title, bcpea_type_match, city_key_from_name,
     city_key_from_name_prefix, cyr_city_key_from_text, latin_city_key_from_text,
-    listing_city_key, load_json_any,
+    compute_motivation_score, listing_city_key, load_json_any,
 )
 
 DATA_DIR = REPO_DATA_DIR
@@ -1523,9 +1523,40 @@ def select_media_best(sorted_sources):
     return pool[0]
 
 
+def recompute_area_metrics(all_listings):
+    """Redo area_avg_price_per_sqm, pct_vs_area_avg and score from the (already normalised) areas.
+
+    The scrapers computed these from the area as it was scraped; build_rows() then normalises `area`, which can move a
+    listing into a different area group, leaving the stored metrics describing the OLD group (and `score` decides which
+    source of a cross-posted group is "best"). Mirrors each scraper's own compute_leads(): the average is per portal
+    (each leads file is averaged on its own), keyed by (city_key, area)."""
+    totals = {}
+    keys = {}
+    for l in all_listings:
+        city_key = listing_city_key(l)
+        key = (l.get("portal"), city_key, l.get("area")) if city_key else None
+        keys[id(l)] = key
+        if key and l.get("price_per_sqm"):
+            totals.setdefault(key, []).append(l["price_per_sqm"])
+    avg = {k: sum(v) / len(v) for k, v in totals.items()}
+    for l in all_listings:
+        key = keys[id(l)]
+        if l.get("price_per_sqm") and key in avg:
+            l["area_avg_price_per_sqm"] = round(avg[key])
+            l["pct_vs_area_avg"] = round((l["price_per_sqm"] - avg[key]) / avg[key] * 100, 1)
+        else:
+            l["area_avg_price_per_sqm"] = None
+            l["pct_vs_area_avg"] = None
+        if all(f in l for f in ("drop_pct", "price_drop_count", "days_on_market", "price_history")):
+            l["score"] = compute_motivation_score(
+                l["drop_pct"], l["price_drop_count"], l["days_on_market"], l["pct_vs_area_avg"], l["price_history"]
+            )
+
+
 def build_rows(all_listings):
     for l in all_listings:
         l["area"] = strip_city_prefix(clean_area(l.get("area")), l.get("city"))  # stored leads_*.json still hold areas scraped before the fix
+    recompute_area_metrics(all_listings)  # metrics stored in leads_*.json were computed from the pre-normalised area
     groups = group_listings(all_listings)
 
     listing_source_rows = []

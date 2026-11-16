@@ -84,7 +84,7 @@ from bs4 import BeautifulSoup
 
 from category_classifier import classify_listing
 from geo_norm import clean_area
-from geo_utils import extract_coords_imoti_net, extract_photos_imoti_net, compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION
+from geo_utils import extract_coords_imoti_net, extract_photos_imoti_net, compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION, crawl_looks_truncated
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; PersonalDealTracker/1.0)"}
 BASE_URL = "https://www.imoti.net/en/obiavi/r/prodava"
@@ -194,7 +194,12 @@ def smallest_container_with_price(link_tag, max_levels=6):
     return None
 
 
+FORBIDDEN_COUNT = 0  # HTTP 401/403 responses seen this process: a portal blocking this runner's IP shows up here
+FORBIDDEN_EXAMPLE = None
+
+
 def fetch_with_retries(url):
+    global FORBIDDEN_COUNT, FORBIDDEN_EXAMPLE
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -214,6 +219,9 @@ def fetch_with_retries(url):
             if status in (404, 410):
                 print(f"DEBUG: {url} permanently gone ({status}) - not retrying")
                 return None
+            if status in (401, 403):
+                FORBIDDEN_COUNT += 1
+                FORBIDDEN_EXAMPLE = FORBIDDEN_EXAMPLE or url
             print(f"DEBUG: request failed for {url} (attempt {attempt}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
@@ -684,6 +692,18 @@ def compute_leads(history):
 def main():
     listings = fetch_listings()
     history = load_history()
+    if history and (not listings or crawl_looks_truncated(history, listings, FORBIDDEN_COUNT > 0, GONE_AFTER)):
+        # A blocked/broken crawl must not be saved: update_history/compute_leads would age every tracked listing it
+        # missed past GONE_AFTER ("removed"), and data_store push would persist that. Either nothing was found, or
+        # requests were blocked AND the crawl is under half of what is tracked as active (a block partway through; one
+        # transient blocked page on a complete crawl is still saved). Writing nothing leaves the files byte-identical,
+        # so push skips them and the release keeps its last good copy.
+        # Visible on the run summary without failing the step (it is continue-on-error and a failure e-mails the owner).
+        reason = (f"HTTP 401/403 on {FORBIDDEN_COUNT} requests (first: {FORBIDDEN_EXAMPLE}) - the site is blocking this runner's IP"
+                  if FORBIDDEN_COUNT else "no request was blocked, so check whether the page markup changed")
+        print(f"Found {len(listings)} listings, {len(history)} tracked - NOT saving, last good history/leads kept")
+        print(f"::warning::imoti.net: only {len(listings)} listings crawled while {len(history)} are tracked - data NOT updated. {reason}")
+        return
     history = update_history(history, listings)
     save_history(history)
     leads = compute_leads(history)

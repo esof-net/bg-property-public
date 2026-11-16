@@ -19,11 +19,14 @@ Environment:
 Concurrency (replaces `git pull --rebase`): `pull` records each asset's id/updated_at/sha256 in
 data/.store_manifest.json. `push` re-reads the release first; if another workflow replaced an asset after our pull,
 history*.json(.gz) files are merged with merge_history_conflict.merge_history (union of snapshots, nothing from either
-side discarded) and derived files (leads_*, stats) keep the remote copy, which self-heals on the next run. Up to 5 attempts.
+side discarded); leads files of the portals in REBUILDABLE_LEADS are rebuilt from that merged history (hourly backfills
+rewrite them, so keeping the remote copy would never self-heal); other derived files (stats) keep the remote copy, which
+self-heals on the next run. Up to 5 attempts.
 """
 import argparse
 import gzip
 import hashlib
+import functools
 import json
 import os
 import sys
@@ -110,6 +113,18 @@ def _check(resp, what):
     return resp
 
 
+def _network_errors_as_store_errors(fn):
+    """A timeout / connection reset is as transient as an HTTP 502: surface it as StoreError so the retry loops in
+    pull() and push(), and main()'s ::error:: reporting, handle it instead of the step dying with a traceback."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except requests.RequestException as e:
+            raise StoreError(f"{fn.__name__}: {type(e).__name__}: {e}") from e
+    return wrapper
+
+
 class GitHubStore:
     """The only class that talks HTTP. Tests replace it with an in-memory fake exposing the same four methods."""
 
@@ -148,6 +163,7 @@ class GitHubStore:
                 return out
             page += 1
 
+    @_network_errors_as_store_errors
     def list_assets(self):
         """name -> {id, name, updated_at, size}; temp upload leftovers are hidden."""
         return {a["name"]: a for a in self._raw_assets() if TMP_MARKER not in a["name"]}
@@ -180,6 +196,7 @@ class GitHubStore:
         except (StoreError, requests.RequestException) as e:
             print(f"::warning::temp-asset sweep for {name} skipped: {e}")
 
+    @_network_errors_as_store_errors
     def download(self, asset, dest):
         url = f"{API}/repos/{self.repo}/releases/assets/{asset['id']}"
         with self.session.get(url, headers=self._headers("application/octet-stream"), stream=True, timeout=300) as r:
@@ -190,6 +207,7 @@ class GitHubStore:
                     f.write(chunk)
         os.replace(tmp, dest)
 
+    @_network_errors_as_store_errors
     def upload_replace(self, name, path, old_asset, run_id="local"):
         """Replace asset `name` with the file at `path` and return the NEW asset ({id, name, updated_at, size}), taken from
         the rename response so it identifies our upload by id (a later listing could show another workflow's asset).
@@ -271,12 +289,50 @@ def _write_json_text_like(path, merged):
         Path(path).write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# Leads files that detect_relistings.compute_leads regenerates in production (its PORTALS). Other leads files keep the
+# remote copy on conflict, because their scrapers' own compute_leads was never shown to match.
+REBUILDABLE_LEADS = {"leads_homes.json.gz", "leads_imot.json.gz", "leads_olx.json.gz", "leads_bazar.json.gz", "leads_imoti_bg.json"}
+
+
+def _rebuild_leads(name, path, data_dir):
+    """Rebuild leads file `name` at `path` from its (already merged) sibling history file. True on success; False when
+    the file is not rebuildable or anything goes wrong, so the caller falls back to keeping the remote copy."""
+    if name not in REBUILDABLE_LEADS:
+        return False
+    history_path = Path(data_dir) / name.replace("leads_", "history_", 1)
+    try:
+        if not history_path.exists():
+            return False
+        from detect_relistings import LEADS_POSTED_FIELD, compute_leads  # lazy: pulls in geo_utils, not needed for pull
+        from geo_utils import load_json_any
+        # olx / imoti.bg date days_on_market from the listing's own posted date, exactly like their scrapers do
+        leads = compute_leads(load_json_any(history_path), LEADS_POSTED_FIELD.get(name))
+        _write_json_text_like(path, leads)
+        return True
+    except Exception as e:  # never let a rebuild problem fail the push
+        print(f"::warning::{name}: could not rebuild from {history_path.name}: {e}")
+        return False
+
+
+def _retry(fn, what, attempts=3, sleep=time.sleep):
+    """Call fn(), retrying StoreError (HTTP errors and, via the GitHubStore wrapper, timeouts/resets) with a backoff.
+    For the list/download calls that sit outside the upload retry loops."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except StoreError as e:
+            print(f"::warning::{what} attempt {attempt}/{attempts}: {e}")
+            if attempt == attempts:
+                raise
+            sleep(attempt * 5)
+
+
 def pull(store, names, data_dir=DATA_DIR, retries=3, sleep=time.sleep):
     """Download `names` (or every asset when names is None) into data_dir and record them in the manifest."""
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(data_dir)
-    assets = store.list_assets()
+    assets = _retry(store.list_assets, "pull: list release assets", sleep=sleep)
     wanted = sorted(assets) if names is None else expand(names)
     missing = [n for n in wanted if n not in assets]
     if missing:
@@ -293,7 +349,7 @@ def pull(store, names, data_dir=DATA_DIR, retries=3, sleep=time.sleep):
                 if attempt == retries:
                     raise
                 sleep(attempt * 5)
-                a = store.list_assets().get(n) or a
+                a = _retry(store.list_assets, "pull: re-list release assets", sleep=sleep).get(n) or a
         manifest[n] = {"id": a["id"], "updated_at": a["updated_at"], "sha256": sha256_of(data_dir / n)}
         print(f"pulled {n} ({a['size'] / 1e6:.1f} MB)")
     save_manifest(data_dir, manifest)
@@ -315,15 +371,19 @@ def push(store, names, data_dir=DATA_DIR, run_id="local", sleep=time.sleep):
                 raise StoreError(f"{n} is {size / 1e9:.2f} GB, over GitHub's 2 GB per-asset limit - not uploading")
             local_sha = sha256_of(path)
             seen = manifest.get(n)
-            if seen and seen.get("sha256") == local_sha:
+            remote = _retry(store.list_assets, f"push {n}: list release assets", sleep=sleep).get(n)
+            if seen and seen.get("sha256") == local_sha and remote is not None:
                 print(f"unchanged, skipping {n}")
                 break
-            remote = store.list_assets().get(n)
+            if seen and remote is None:
+                # deleted from the release, or a replacement died between "delete old" and "rename": skipping
+                # would leave the release without this file forever, so upload our copy again
+                print(f"::warning::{n}: missing from the release - re-uploading the local copy")
             moved = remote is not None and (seen is None or remote["updated_at"] != seen.get("updated_at") or remote["id"] != seen.get("id"))
             if moved:
                 # another workflow replaced it after our pull (or we never pulled it): reconcile, then retry
                 remote_copy = data_dir / ("remote-" + n)  # keep the .gz suffix: _read_text decides by filename
-                store.download(remote, remote_copy)
+                _retry(lambda: store.download(remote, remote_copy), f"push {n}: download remote copy", sleep=sleep)
                 if is_history_file(n):
                     merged = merge_history(_read_text(remote_copy), _read_text(path))
                     _write_json_text_like(path, merged)
@@ -343,6 +403,12 @@ def push(store, names, data_dir=DATA_DIR, run_id="local", sleep=time.sleep):
                         remote_copy.unlink()
                         save_manifest(data_dir, manifest)
                         continue
+                if _rebuild_leads(n, path, data_dir):
+                    print(f"{n}: remote changed since pull - rebuilt from the merged history instead of keeping the remote copy")
+                    manifest[n] = {"id": remote["id"], "updated_at": remote["updated_at"], "sha256": sha256_of(remote_copy)}
+                    remote_copy.unlink()
+                    save_manifest(data_dir, manifest)
+                    continue  # re-check, then upload the rebuilt file
                 os.replace(remote_copy, path)
                 print(f"::warning::{n}: remote changed since pull and it is derived data - keeping the remote copy, it self-heals next run")
                 manifest[n] = {"id": remote["id"], "updated_at": remote["updated_at"], "sha256": sha256_of(path)}
