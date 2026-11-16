@@ -38,7 +38,7 @@ import sys
 import time
 from pathlib import Path
 from paths import DATA_DIR as REPO_DATA_DIR
-from geo_norm import clean_area, strip_city_prefix
+from geo_norm import clean_area, snap_to_known_area, strip_city_prefix
 
 import requests
 
@@ -1523,6 +1523,31 @@ def select_media_best(sorted_sources):
     return pool[0]
 
 
+# Portals whose area comes from a dedicated location field; alo.bg/bazar.bg/olx.bg cut it out of free text and glue ad words to it.
+STRUCTURED_AREA_PORTALS = ("imot.bg", "homes.bg", "imoti.bg")
+SNAPPED_AREA_PORTALS = ("alo.bg", "bazar.bg", "olx.bg")
+
+
+def snap_free_text_areas(all_listings):
+    """Per city, an alo/bazar/olx area that is not a known area of that city ("Билла Възрожденци") becomes the longest trailing part that is
+    one ("Възрожденци"), the known areas being those the structured portals gave. Changes l["area"] in place."""
+    # A listing without a resolved city (villages, unknown towns) has no city to learn from or snap to: pooling them under one
+    # "None" city would let a free-text area be snapped to a name from an unrelated place, so they are left as cleaned.
+    known = {}
+    for l in all_listings:
+        if l.get("portal") in STRUCTURED_AREA_PORTALS and l.get("area"):
+            city_key = listing_city_key(l)
+            key = normalize_area(l["area"])
+            if city_key and key:
+                known.setdefault(city_key, set()).add(key)
+    for l in all_listings:
+        if l.get("portal") in SNAPPED_AREA_PORTALS and l.get("area"):
+            city_key = listing_city_key(l)
+            keys = known.get(city_key) if city_key else None
+            if keys:
+                l["area"] = snap_to_known_area(l["area"], keys, normalize_area)
+
+
 def recompute_area_metrics(all_listings):
     """Redo area_avg_price_per_sqm, pct_vs_area_avg and score from the (already normalised) areas.
 
@@ -1534,7 +1559,8 @@ def recompute_area_metrics(all_listings):
     keys = {}
     for l in all_listings:
         city_key = listing_city_key(l)
-        key = (l.get("portal"), city_key, l.get("area")) if city_key else None
+        # No area -> no area group: averaging every area-less listing of a portal+city together would give each a made-up "area average"
+        key = (l.get("portal"), city_key, l.get("area")) if city_key and l.get("area") else None
         keys[id(l)] = key
         if key and l.get("price_per_sqm"):
             totals.setdefault(key, []).append(l["price_per_sqm"])
@@ -1556,6 +1582,7 @@ def recompute_area_metrics(all_listings):
 def build_rows(all_listings):
     for l in all_listings:
         l["area"] = strip_city_prefix(clean_area(l.get("area")), l.get("city"))  # stored leads_*.json still hold areas scraped before the fix
+    snap_free_text_areas(all_listings)
     recompute_area_metrics(all_listings)  # metrics stored in leads_*.json were computed from the pre-normalised area
     groups = group_listings(all_listings)
 

@@ -78,6 +78,7 @@ from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
 from category_classifier import classify_listing
+from geo_norm import area_or_city
 from geo_utils import (
     Geocoder, extract_description_ldjson, extract_photos_ldjson, extract_sqm_ldjson,
     compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records,
@@ -285,11 +286,13 @@ def fetch_listings_page(page, url, seen, geocoder, oblast_display):
             m = CITY_AREA_LINE_RE.match(l)
             if m:
                 city, area = m.group(1).strip(), m.group(2).strip()
+                area = area_or_city(area, city)  # an ad headline ("... 58000евро!") is not a place: only the city is known; "Апартамент Възрожденци" -> "Възрожденци"
                 site_updated_at = parse_site_updated_at(l)
                 break
             m2 = VILLAGE_LINE_RE.match(l)
             if m2:
                 city = area = m2.group(1).strip()
+                area = area_or_city(area, city)
                 site_updated_at = parse_site_updated_at(l)
                 break
 
