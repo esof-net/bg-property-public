@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<!-- SECURITY BOUNDARY (task 51774). The email link carries a one-time token in the query string. Nothing that can
+     leak it may load before it is removed from the URL, so, in this order:
+       1. no-referrer policy (also stops the URL being sent as a Referer by anything that loads later);
+       2. an inline script that copies the allow-listed values into a closure and calls history.replaceState;
+       3. only then the first-party module. There are NO external scripts, styles, fonts, favicons or trackers on
+          this page. The token is never written to any storage and never logged.
+     The token is exchanged only when the user presses the button (email scanners that GET the link must not
+     consume it). -->
+<meta name="referrer" content="no-referrer" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Imoten Radar - account</title>
+<script>
+(function () {
+  var taken = null;
+  try {
+    var q = new URLSearchParams(window.location.search);
+    var type = q.get('auth_type');
+    var hash = q.get('token_hash');
+    var typeOk = type === 'signup' || type === 'recovery' || type === 'email_change';
+    if (typeOk && hash && /^[A-Za-z0-9_-]{16,128}$/.test(hash)) {
+      taken = { type: type, tokenHash: hash };
+    }
+  } catch (e) { taken = null; }
+  // Remove ALL credential-bearing parts (query and fragment) before anything else runs.
+  try { window.history.replaceState(null, '', window.location.pathname); } catch (e) {}
+  // One-shot getter: the first-party module reads it once, then it is empty.
+  window.__imotenAuthCallback = {
+    take: function () { var v = taken; taken = null; return v; }
+  };
+})();
+</script>
+<style>:root{--lightningcss-light:initial;--lightningcss-dark: ;color-scheme:light}body{color:#1b2434;box-sizing:border-box;background:#f5f1e8;justify-content:center;align-items:center;min-height:100vh;margin:0;padding:16px;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex}main{box-sizing:border-box;background:#fbf8f1;border:1px solid #d9d2c3;border-radius:8px;width:100%;max-width:420px;padding:28px}h1{margin:0 0 12px;font-family:Georgia,Times New Roman,serif;font-size:22px;font-weight:500}p{margin:0 0 14px;font-size:14px;line-height:1.6}label{text-transform:uppercase;letter-spacing:.03em;color:#6b6355;margin:0 0 6px;font-size:11px;display:block}input{box-sizing:border-box;border:1px solid #d9d2c3;border-radius:4px;width:100%;margin-bottom:14px;padding:10px 12px;font-size:14px}input:focus{outline-offset:0;outline:2px solid #a07c3b}button{cursor:pointer;color:#fbf8f1;background:#a07c3b;border:1px solid #a07c3b;border-radius:4px;width:100%;margin-bottom:10px;padding:11px 14px;font-size:14px}button.secondary{color:#1b2434;background:0 0;border-color:#d9d2c3}button[disabled]{opacity:.6;cursor:not-allowed}.error{color:#8c2b2b}[hidden]{display:none!important}a{color:#7a5d27}</style>
+  <script type="module" crossorigin src="/_vite/authCallback-DLyerD1d.js"></script>
+  <link rel="modulepreload" crossorigin href="/_vite/errors-BAjHLk9W.js">
+</head>
+<body>
+<main>
+  <h1 id="cbTitle">One moment…</h1>
+  <p id="cbText" role="status" aria-live="polite"></p>
+  <p id="cbError" class="error" role="alert" aria-live="assertive" hidden></p>
+
+  <div id="cbConfirm" hidden>
+    <button type="button" id="cbConfirmBtn">Confirm</button>
+  </div>
+
+  <div id="cbMismatch" hidden>
+    <button type="button" id="cbSwitchBtn">Sign out and continue</button>
+    <button type="button" class="secondary" id="cbMismatchCancelBtn">Cancel</button>
+  </div>
+
+  <form id="cbPasswordForm" hidden novalidate>
+    <label for="cbNewPassword">New password</label>
+    <input type="password" id="cbNewPassword" autocomplete="new-password" />
+    <label for="cbNewPassword2">Repeat new password</label>
+    <input type="password" id="cbNewPassword2" autocomplete="new-password" />
+    <button type="submit" id="cbPasswordSubmit">Set new password</button>
+    <button type="button" class="secondary" id="cbPasswordCancel">Cancel</button>
+  </form>
+
+  <div id="cbDone" hidden>
+    <button type="button" id="cbHomeBtn">Continue to Imoten Radar</button>
+  </div>
+  <div id="cbDead" hidden>
+    <button type="button" id="cbDeadBtn">Back to Imoten Radar</button>
+  </div>
+</main>
+</body>
+</html>
