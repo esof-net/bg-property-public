@@ -81,7 +81,7 @@ from category_classifier import classify_listing
 from geo_norm import area_or_city
 from geo_utils import (
     Geocoder, extract_description_ldjson, extract_photos_ldjson, extract_sqm_ldjson,
-    compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records,
+    compute_motivation_score, listing_city_key, market_reference_date, prune_snapshots, evict_stale_records,
     STALE_RECORD_RETENTION, load_json_any, save_json_any,
 )
 
@@ -688,7 +688,7 @@ def compute_leads(history):
 
         latest = rec["latest"]
         site_updated_at = latest.get("site_updated_at")
-        reference_date = datetime.fromisoformat(site_updated_at) if site_updated_at else datetime.fromisoformat(rec["first_seen"])
+        reference_date = market_reference_date(rec["first_seen"], site_updated_at)
         days_on_market = max((effective_now - reference_date).days, 0)
         price_per_sqm = round(last_price / latest["sqm"]) if latest.get("sqm") else None
 

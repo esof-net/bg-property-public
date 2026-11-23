@@ -1623,6 +1623,16 @@ def build_rows(all_listings):
         # generic MERGED_FIELDS loop above rather than excluding them from
         # it, so this stays a clearly-scoped override, not a second parallel
         # field list to keep in sync with MERGED_FIELDS.
+        # days_on_market: the group has been on the market as long as its OLDEST member, not whichever member scored
+        # highest (that one may be a younger cross-post, or a removed one whose value froze at its last-seen date).
+        member_days = [s["days_on_market"] for s in sorted_sources if s.get("days_on_market") is not None]
+        if member_days and max(member_days) != merged.get("days_on_market"):
+            merged["days_on_market"] = max(member_days)
+            if all(f in merged for f in ("drop_pct", "price_drop_count", "pct_vs_area_avg", "price_history")):
+                merged["score"] = compute_motivation_score(
+                    merged["drop_pct"], merged["price_drop_count"], merged["days_on_market"],
+                    merged["pct_vs_area_avg"], merged["price_history"],
+                )
         media_best = select_media_best(sorted_sources)
         for f in MEDIA_FIELDS:
             merged[f] = media_best.get(f)
