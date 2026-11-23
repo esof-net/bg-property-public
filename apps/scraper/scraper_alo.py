@@ -136,7 +136,7 @@ from bs4 import BeautifulSoup
 from geo_norm import clean_area, strip_city_prefix
 from geo_utils import (
     extract_coords_alo, extract_description_alo, extract_photos_alo, extract_specs_alo,
-    extract_contact_alo, compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records,
+    extract_contact_alo, compute_motivation_score, listing_city_key, market_reference_date, prune_snapshots, evict_stale_records,
     STALE_RECORD_RETENTION, load_json_any, save_json_any,
 )
 from category_classifier import classify_listing
@@ -880,9 +880,7 @@ def compute_leads(history):
 
         latest = rec["latest"]
         site_updated_at = latest.get("site_updated_at")
-        reference_date = (
-            datetime.fromisoformat(site_updated_at) if site_updated_at else datetime.fromisoformat(rec["first_seen"])
-        )
+        reference_date = market_reference_date(rec["first_seen"], site_updated_at)
         days_on_market = max((effective_now - reference_date).days, 0)
         price_per_sqm = round(last_price / latest["sqm"]) if latest.get("sqm") else None
 

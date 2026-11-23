@@ -69,6 +69,21 @@ CATEGORY_KEYWORDS = {
 }
 
 
+def market_reference_date(first_seen, posted=None):
+    """Start date for days_on_market: the EARLIEST of when we first tracked the listing and the portal's own date.
+
+    The portal date on alo.bg/olx.bg is "last updated", which resets on every edit/price cut, so using it alone made
+    listings with many price drops look young. Taking the minimum can only move a listing older, never younger.
+    Naive datetimes (imoti.net/imoti.bg posted dates) are treated as UTC."""
+    def _dt(v):
+        if not v:
+            return None
+        d = datetime.fromisoformat(v) if isinstance(v, str) else v
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    dates = [d for d in (_dt(first_seen), _dt(posted)) if d]
+    return min(dates)
+
+
 def classify_category(title):
     """Best-effort category from a Bulgarian listing title. Defaults to
     'apartment' when nothing matches, which is correct for every portal

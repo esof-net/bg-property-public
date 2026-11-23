@@ -97,7 +97,7 @@ from bs4 import BeautifulSoup
 
 from geo_utils import (
     Geocoder, compute_motivation_score, extract_contact_imoti_bg, extract_specs_imoti_bg,
-    imoti_bg_ld_json_diagnostic, listing_city_key, prune_snapshots, evict_stale_records,
+    imoti_bg_ld_json_diagnostic, listing_city_key, market_reference_date, prune_snapshots, evict_stale_records,
     STALE_RECORD_RETENTION,
 )
 from category_classifier import classify_listing
@@ -591,14 +591,13 @@ def compute_leads(history):
             continue
         first_price, last_price = prices[0], prices[-1]
         drop_pct = round((first_price - last_price) / first_price * 100, 1) if first_price else 0
-        first_seen = datetime.fromisoformat(rec["first_seen"])
         last_seen = datetime.fromisoformat(rec["snapshots"][-1]["seen_at"])
         source_status = "active" if (datetime.now(timezone.utc) - last_seen) <= GONE_AFTER else "removed"
         effective_now = last_seen if source_status == "removed" else datetime.now(timezone.utc)
 
         latest = rec["latest"]
         site_posted_at = latest.get("site_posted_at")
-        reference_date = datetime.fromisoformat(site_posted_at) if site_posted_at else first_seen
+        reference_date = market_reference_date(rec["first_seen"], site_posted_at)
         days_on_market = max((effective_now - reference_date).days, 0)
         price_history = []
         last_hist_price = None

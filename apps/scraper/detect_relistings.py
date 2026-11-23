@@ -45,7 +45,7 @@ from pathlib import Path
 from paths import DATA_DIR as REPO_DATA_DIR
 
 from geo_utils import (
-    compute_motivation_score, listing_city_key, relisting_chain_guard_tripped,
+    compute_motivation_score, listing_city_key, market_reference_date, relisting_chain_guard_tripped,
     load_json_any, save_json_any,
 )
 
@@ -214,15 +214,11 @@ def compute_leads(history, posted_field=None):
             continue
         first_price, last_price = prices[0], prices[-1]
         drop_pct = round((first_price - last_price) / first_price * 100, 1) if first_price else 0
-        first_seen = datetime.fromisoformat(rec["first_seen"])
         last_seen = datetime.fromisoformat(rec["snapshots"][-1]["seen_at"])
         source_status = "active" if (datetime.now(timezone.utc) - last_seen) <= GONE_AFTER else "removed"
         effective_now = last_seen if source_status == "removed" else datetime.now(timezone.utc)
         posted = rec["latest"].get(posted_field) if posted_field else None
-        if posted:
-            days_on_market = max((effective_now - datetime.fromisoformat(posted)).days, 0)
-        else:
-            days_on_market = (effective_now - first_seen).days
+        days_on_market = max((effective_now - market_reference_date(rec["first_seen"], posted)).days, 0)
 
         price_history = []
         last_hist_price = None

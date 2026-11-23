@@ -84,7 +84,7 @@ from bs4 import BeautifulSoup
 
 from category_classifier import classify_listing
 from geo_norm import clean_area
-from geo_utils import extract_coords_imoti_net, extract_photos_imoti_net, compute_motivation_score, listing_city_key, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION, crawl_looks_truncated
+from geo_utils import extract_coords_imoti_net, extract_photos_imoti_net, compute_motivation_score, listing_city_key, market_reference_date, prune_snapshots, evict_stale_records, STALE_RECORD_RETENTION, crawl_looks_truncated
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; PersonalDealTracker/1.0)"}
 BASE_URL = "https://www.imoti.net/en/obiavi/r/prodava"
@@ -626,11 +626,7 @@ def compute_leads(history):
 
         latest = rec["latest"]
         site_posted_at = latest.get("site_posted_at")
-        reference_date = (
-            datetime.fromisoformat(site_posted_at).replace(tzinfo=timezone.utc)
-            if site_posted_at
-            else datetime.fromisoformat(rec["first_seen"])
-        )
+        reference_date = market_reference_date(rec["first_seen"], site_posted_at)
         days_on_market = max((effective_now - reference_date).days, 0)
         price_per_sqm = round(last_price / latest["sqm"]) if latest.get("sqm") else None
 
